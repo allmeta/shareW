@@ -1,0 +1,14 @@
+[package]
+name = "sharew"
+version = "0.1.0"
+edition = "2021"
+description = "Standalone screenshot annotation tool (rectangle, line, arrow, freehand, highlight, blur)"
+
+[[bin]]
+name = "sharew"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+cairo-rs = { version = "0.21", features = ["png"] }
+smithay-client-toolkit = "0.19"
