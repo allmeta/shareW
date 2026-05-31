@@ -1,0 +1,46 @@
+name: release
+
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system dependencies (cached)
+        uses: awalsh128/cache-apt-pkgs-action@v1
+        with:
+          packages: pkg-config libcairo2-dev libwayland-dev libxkbcommon-dev
+          version: 1
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # Cache target/ across runs (default true) and also save on PR runs.
+          save-if: true
+
+      - name: Build
+        run: cargo build --release --locked
+
+      - name: Package
+        run: |
+          mkdir -p dist
+          strip target/release/sharew
+          cp target/release/sharew dist/sharew-linux-x86_64
+
+      - name: Update rolling "latest" release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: latest
+          name: Latest build
+          body: |
+            Rolling build from `${{ github.ref_name }}` @ `${{ github.sha }}`.
+          files: dist/sharew-linux-x86_64
+          make_latest: true
