@@ -77,6 +77,12 @@ struct Overlay {
     /// Output scale (logical pointer coords are multiplied by this).
     scale: i32,
     configured: bool,
+    /// True after a commit that requested a frame callback, until the callback fires. While set,
+    /// further redraws are coalesced into `needs_redraw` so we paint at most once per display
+    /// frame instead of once per pointer event.
+    frame_pending: bool,
+    /// A redraw was requested while `frame_pending` was set; draw once the callback fires.
+    needs_redraw: bool,
 }
 
 impl Overlay {
@@ -99,6 +105,7 @@ struct State {
     layer_shell: LayerShell,
     screencopy: ZwlrScreencopyManagerV1,
     pool: SlotPool,
+    qh: QueueHandle<State>,
 
     keyboard: Option<WlKeyboard>,
     themed_pointer: Option<ThemedPointer>,
@@ -144,6 +151,7 @@ fn main() -> anyhow::Result<()> {
         layer_shell,
         screencopy,
         pool,
+        qh: qh.clone(),
         keyboard: None,
         themed_pointer: None,
         ctrl: false,
@@ -262,6 +270,8 @@ fn main() -> anyhow::Result<()> {
             size: (c.w, c.h),
             scale: c.scale,
             configured: false,
+            frame_pending: false,
+            needs_redraw: false,
         });
     }
 
@@ -310,9 +320,25 @@ impl State {
             .position(|o| o.layer.wl_surface() == surface)
     }
 
-    fn draw_all(&mut self) {
+    /// Coalesces redraws across all overlays into at most one paint per output per frame.
+    fn request_redraw_all(&mut self) {
         for i in 0..self.overlays.len() {
-            self.draw(i);
+            self.request_redraw(i);
+        }
+    }
+
+    /// Either paints now (if no frame callback is in flight) or marks the overlay dirty so it
+    /// will repaint when the callback fires. This stops a fast-moving pointer from queuing up
+    /// commits faster than the compositor can display them — which was making the first stroke
+    /// trail behind the cursor.
+    fn request_redraw(&mut self, index: usize) {
+        let Some(o) = self.overlays.get_mut(index) else {
+            return;
+        };
+        if o.frame_pending {
+            o.needs_redraw = true;
+        } else {
+            self.draw(index);
         }
     }
 
@@ -386,7 +412,13 @@ impl State {
             return;
         }
         surface.damage_buffer(0, 0, w, h);
+        // Throttle to the compositor's frame rate: the next paint waits until the compositor has
+        // shown this one. Mark the overlay clean *before* requesting the callback so a redraw
+        // request that arrives during commit still gets a follow-up paint.
+        surface.frame(&self.qh, surface.clone());
         surface.commit();
+        self.overlays[index].frame_pending = true;
+        self.overlays[index].needs_redraw = false;
     }
 
     fn handle_action(&mut self, action: Action) {
@@ -515,7 +547,7 @@ impl LayerShellHandler for State {
             .position(|o| &o.layer == layer)
         {
             self.overlays[index].configured = true;
-            self.draw(index);
+            self.request_redraw(index);
         }
     }
 }
@@ -525,7 +557,15 @@ impl LayerShellHandler for State {
 impl CompositorHandler for State {
     fn scale_factor_changed(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &WlSurface, _: i32) {}
     fn transform_changed(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &WlSurface, _: smithay_client_toolkit::reexports::client::protocol::wl_output::Transform) {}
-    fn frame(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &WlSurface, _: u32) {}
+    fn frame(&mut self, _: &Connection, _: &QueueHandle<Self>, surface: &WlSurface, _: u32) {
+        let Some(index) = self.overlay_index(surface) else {
+            return;
+        };
+        self.overlays[index].frame_pending = false;
+        if self.overlays[index].needs_redraw {
+            self.draw(index);
+        }
+    }
     fn surface_enter(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &WlSurface, _: &WlOutput) {}
     fn surface_leave(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &WlSurface, _: &WlOutput) {}
 }
@@ -613,7 +653,7 @@ impl KeyboardHandler for State {
             None => Action::None,
         };
         self.handle_action(action);
-        self.draw_all();
+        self.request_redraw_all();
     }
 }
 
@@ -710,10 +750,10 @@ impl PointerHandler for State {
             }
         }
         if redraw_all {
-            self.draw_all();
+            self.request_redraw_all();
         } else if redraw_active {
             if let Some(i) = self.active {
-                self.draw(i);
+                self.request_redraw(i);
             }
         }
     }
