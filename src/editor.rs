@@ -18,6 +18,7 @@ enum Drag {
     NewSelection,
     Draw,
     Slider,
+    ColorWheel,
 }
 
 pub struct Editor {
@@ -217,16 +218,19 @@ impl Editor {
         if self.show_color_wheel {
             let (bounds, center, radius) = render::color_wheel_layout(self.view, self.scale);
             if bounds.contains(x, y) {
+                // Swatches: select immediately and close the wheel.
                 for (i, r) in render::preset_swatch_rects(bounds, self.scale).iter().enumerate() {
                     if r.contains(x, y) {
                         *self.active_color_mut() = render::PRESET_COLORS[i];
+                        self.show_color_wheel = false;
                         return;
                     }
                 }
+                // Inside the wheel: preview while dragging, commit on pointer up.
                 if let Some(rgb) = render::wheel_color_at(point, center, radius) {
                     *self.active_color_mut() = [rgb[0], rgb[1], rgb[2], 1.];
+                    self.drag = Drag::ColorWheel;
                 }
-                self.show_color_wheel = false;
                 return;
             }
         }
@@ -329,6 +333,12 @@ impl Editor {
             Drag::NewSelection => {
                 self.selection.1 = (x, y);
             }
+            Drag::ColorWheel => {
+                let (_, center, radius) = render::color_wheel_layout(self.view, self.scale);
+                if let Some(rgb) = render::wheel_color_at((x, y), center, radius) {
+                    *self.active_color_mut() = [rgb[0], rgb[1], rgb[2], 1.];
+                }
+            }
             Drag::None => {}
         }
     }
@@ -354,6 +364,9 @@ impl Editor {
                     self.selection = self.selection_backup;
                     self.has_selection = self.had_selection_backup;
                 }
+            }
+            Drag::ColorWheel => {
+                self.show_color_wheel = false;
             }
             _ => {}
         }
