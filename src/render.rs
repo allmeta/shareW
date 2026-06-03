@@ -5,7 +5,7 @@
 
 use std::f64::consts::{FRAC_PI_2, PI, TAU};
 
-use cairo::{Context, Filter, FontSlant, FontWeight, ImageSurface, LineCap, LineJoin, Matrix};
+use cairo::{Context, Extend, Filter, FontSlant, FontWeight, ImageSurface, LineCap, LineJoin, Matrix};
 
 // Annotation drawing.
 pub const DEFAULT_THICKNESS: f64 = 4.;
@@ -14,7 +14,9 @@ pub const MAX_THICKNESS: f64 = 100.;
 pub const HIGHLIGHT_THICKNESS: f64 = 24.;
 pub const HIGHLIGHT_ALPHA: f64 = 0.4;
 pub const BLUR_THICKNESS: f64 = 24.;
-pub const BLUR_BLOCK: i32 = 10;
+// The frosted-glass blur is computed on a copy shrunk by this factor (cheaper to blur, pre-softens)
+// and then bilinearly upscaled back.
+pub const BLUR_DOWNSAMPLE: i32 = 2;
 pub const DEFAULT_COLOR: [f64; 4] = [0.9, 0.1, 0.1, 1.];
 pub const HIGHLIGHT_COLOR: [f64; 4] = [1., 0.85, 0.1, 1.];
 
@@ -93,7 +95,7 @@ impl Tool {
         matches!(self, Tool::Highlight)
     }
     pub fn is_freehand(self) -> bool {
-        matches!(self, Tool::Freehand | Tool::Highlight | Tool::Blur)
+        matches!(self, Tool::Freehand)
     }
 }
 
@@ -348,19 +350,147 @@ fn rounded_rect(cr: &Context, x: f64, y: f64, w: f64, h: f64, r: f64) {
     cr.close_path();
 }
 
-pub fn build_blur_mosaic(src: &ImageSurface, w: i32, h: i32, block: i32) -> anyhow::Result<ImageSurface> {
-    let small = ImageSurface::create(cairo::Format::ARgb32, (w / block).max(1), (h / block).max(1))?;
-    let cr = Context::new(&small)?;
-    cr.scale(1. / block as f64, 1. / block as f64);
-    cr.set_source_surface(src, 0., 0.)?;
-    cr.paint()?;
-    drop(cr);
-    Ok(small)
+// Frosted-glass blur radius in logical px (scaled for HiDPI), applied as several box-blur passes
+// which together approximate a Gaussian. Larger = more obscured.
+const BLUR_RADIUS: i32 = 6;
+// Three stacked box blurs approximate a Gaussian closely enough to look like ground glass.
+const BLUR_PASSES: u32 = 3;
+// Light per-pixel jitter so the result isn't a purely deterministic (and thus invertible) blur.
+// Kept subtle — just enough grain to break reversibility without looking noisy.
+const BLUR_NOISE: i32 = 10;
+
+/// Builds the frosted-glass surface used by the blur tool. The image is shrunk by
+/// `BLUR_DOWNSAMPLE`, box-blurred several times (≈ Gaussian) for a smooth ground-glass look, then
+/// jittered with a little non-deterministic noise so the blur can't be cleanly reversed. The caller
+/// bilinearly upscales it back over the redacted region. Returns the surface and its downsample
+/// factor (the caller's pattern scale).
+pub fn build_blur_surface(src: &ImageSurface, w: i32, h: i32, scale: f64) -> anyhow::Result<(ImageSurface, i32)> {
+    let ds = BLUR_DOWNSAMPLE;
+    let (sw, sh) = ((w / ds).max(1), (h / ds).max(1));
+    let mut small = ImageSurface::create(cairo::Format::ARgb32, sw, sh)?;
+    {
+        let cr = Context::new(&small)?;
+        cr.scale(1. / ds as f64, 1. / ds as f64);
+        cr.set_source_surface(src, 0., 0.)?;
+        cr.paint()?;
+    }
+
+    // Radius is measured in full-resolution px; convert into the downsampled image's coordinates.
+    let radius = (rnd(scale, BLUR_RADIUS) / ds).max(1);
+    let stride = small.stride() as usize;
+    {
+        let mut data = small.data().map_err(|e| anyhow::anyhow!("{e}"))?;
+        box_blur(&mut data, sw, sh, stride, radius, BLUR_PASSES);
+        // A plain blur is a deterministic, invertible convolution; sprinkling in fresh OS-seeded
+        // noise destroys the exact relationship so the original can't be deconvolved back out.
+        let mut rng = Xorshift::from_entropy();
+        for y in 0..sh as usize {
+            let row = &mut data[y * stride..y * stride + sw as usize * 4];
+            for px in row.chunks_exact_mut(4) {
+                // ARGB32 little-endian is B, G, R, A; regions are opaque so alpha is left alone.
+                for c in &mut px[..3] {
+                    *c = (*c as i32 + rng.next_range(BLUR_NOISE)).clamp(0, 255) as u8;
+                }
+            }
+        }
+    }
+    Ok((small, ds))
 }
 
-pub fn blur_block(scale: f64) -> i32 {
-    rnd(scale, BLUR_BLOCK).max(1)
+/// Separable box blur (`passes` iterations ≈ Gaussian) over the BGRA buffer. Alpha is preserved;
+/// edges are clamped. Uses a running-sum sliding window, so cost is independent of `radius`.
+fn box_blur(data: &mut [u8], w: i32, h: i32, stride: usize, radius: i32, passes: u32) {
+    if radius < 1 {
+        return;
+    }
+    let mut tmp = vec![0u8; data.len()];
+    for _ in 0..passes {
+        box_blur_h(data, &mut tmp, w, h, stride, radius);
+        box_blur_v(&tmp, data, w, h, stride, radius);
+    }
 }
+
+fn box_blur_h(src: &[u8], dst: &mut [u8], w: i32, h: i32, stride: usize, r: i32) {
+    let win = (2 * r + 1) as u32;
+    for y in 0..h as usize {
+        let row = y * stride;
+        for c in 0..3 {
+            let mut sum: u32 = 0;
+            for k in -r..=r {
+                sum += src[row + k.clamp(0, w - 1) as usize * 4 + c] as u32;
+            }
+            for x in 0..w {
+                dst[row + x as usize * 4 + c] = (sum / win) as u8;
+                let x_out = (x - r).clamp(0, w - 1) as usize;
+                let x_in = (x + r + 1).clamp(0, w - 1) as usize;
+                sum = sum + src[row + x_in * 4 + c] as u32 - src[row + x_out * 4 + c] as u32;
+            }
+        }
+        for x in 0..w as usize {
+            dst[row + x * 4 + 3] = src[row + x * 4 + 3];
+        }
+    }
+}
+
+fn box_blur_v(src: &[u8], dst: &mut [u8], w: i32, h: i32, stride: usize, r: i32) {
+    let win = (2 * r + 1) as u32;
+    for x in 0..w as usize {
+        let col = x * 4;
+        for c in 0..3 {
+            let mut sum: u32 = 0;
+            for k in -r..=r {
+                sum += src[k.clamp(0, h - 1) as usize * stride + col + c] as u32;
+            }
+            for y in 0..h {
+                dst[y as usize * stride + col + c] = (sum / win) as u8;
+                let y_out = (y - r).clamp(0, h - 1) as usize;
+                let y_in = (y + r + 1).clamp(0, h - 1) as usize;
+                sum = sum + src[y_in * stride + col + c] as u32 - src[y_out * stride + col + c] as u32;
+            }
+        }
+        for y in 0..h as usize {
+            dst[y * stride + col + 3] = src[y * stride + col + 3];
+        }
+    }
+}
+
+/// Small non-cryptographic xorshift PRNG, seeded from OS entropy so the noise differs every run
+/// and can't be subtracted back out.
+struct Xorshift(u64);
+
+impl Xorshift {
+    fn from_entropy() -> Self {
+        let mut seed = [0u8; 8];
+        // /dev/urandom is the entropy source on the Linux/Wayland target this tool runs on.
+        let s = std::fs::File::open("/dev/urandom")
+            .and_then(|mut f| std::io::Read::read_exact(&mut f, &mut seed))
+            .map(|_| u64::from_ne_bytes(seed))
+            .unwrap_or_else(|_| {
+                // Fall back to a time-based seed if /dev/urandom is unavailable.
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos() as u64)
+                    .unwrap_or(0x9e3779b97f4a7c15)
+            });
+        Xorshift(s | 1)
+    }
+
+    fn next_u64(&mut self) -> u64 {
+        let mut x = self.0;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        self.0 = x;
+        x
+    }
+
+    /// Uniform integer in [-mag, mag].
+    fn next_range(&mut self, mag: i32) -> i32 {
+        let span = (mag * 2 + 1) as u64;
+        (self.next_u64() % span) as i32 - mag
+    }
+}
+
 
 fn stroke_freehand(cr: &Context, a: &Annotation, lw: f64) -> anyhow::Result<()> {
     cr.set_line_cap(LineCap::Round);
@@ -443,20 +573,48 @@ fn draw_annotation(
             stroke_freehand(cr, a, lw)?;
         }
         Tool::Highlight => {
+            let rect = rect_from_corner_points(a.start, a.end);
+            cr.rectangle(rect.x as f64, rect.y as f64, rect.w as f64, rect.h as f64);
             cr.set_source_rgba(r, g, b, HIGHLIGHT_ALPHA);
-            stroke_freehand(cr, a, lw)?;
+            cr.fill()?;
         }
         Tool::Blur => {
             if let Some((mosaic, block)) = blur {
+                let rect = rect_from_corner_points(a.start, a.end);
                 let pattern = cairo::SurfacePattern::create(mosaic);
-                pattern.set_filter(Filter::Nearest);
+                // Bilinear (instead of Nearest) interpolates between the downsampled+noised blocks
+                // for a smooth "frosted glass" look rather than hard mosaic squares. This is purely
+                // cosmetic: the original detail was already destroyed at the downsample+noise step,
+                // so smoothing the result doesn't make it any more recoverable.
+                pattern.set_filter(Filter::Bilinear);
+                // Clamp to edge pixels so the interpolation doesn't bleed transparency in at the
+                // rectangle's borders.
+                pattern.set_extend(Extend::Pad);
                 let s = block as f64;
                 pattern.set_matrix(Matrix::new(1. / s, 0., 0., 1. / s, 0., 0.));
                 cr.set_source(&pattern)?;
-                stroke_freehand(cr, a, lw)?;
+                cr.rectangle(rect.x as f64, rect.y as f64, rect.w as f64, rect.h as f64);
+                cr.fill()?;
             }
         }
     }
+    Ok(())
+}
+
+/// Lightweight placeholder shown while a blur rectangle is being dragged: a dashed outline with a
+/// faint fill, so the actual (costly) frosted-glass effect only needs to be drawn on mouse up.
+fn draw_blur_preview(cr: &Context, a: &Annotation, scale: f64) -> anyhow::Result<()> {
+    let rect = rect_from_corner_points(a.start, a.end);
+    let (x, y, w, h) = (rect.x as f64, rect.y as f64, rect.w as f64, rect.h as f64);
+    cr.rectangle(x, y, w, h);
+    cr.set_source_rgba(0.5, 0.5, 0.5, 0.25);
+    cr.fill()?;
+    cr.rectangle(x, y, w, h);
+    cr.set_source_rgba(1., 1., 1., 0.8);
+    cr.set_line_width(scale);
+    cr.set_dash(&[4. * scale, 4. * scale], 0.);
+    cr.stroke()?;
+    cr.set_dash(&[], 0.);
     Ok(())
 }
 
@@ -471,7 +629,14 @@ pub fn draw_annotations(
         draw_annotation(cr, a, scale, blur)?;
     }
     if let Some(d) = draw {
-        draw_annotation(cr, d, scale, blur)?;
+        // Painting the frosted-glass fill means bilinearly upscaling the blur surface across the
+        // whole region on every pointer move, which is wasteful mid-drag. Show a cheap outline of
+        // the area instead; the real blur is rendered once the stroke is committed on mouse up.
+        if d.tool == Tool::Blur {
+            draw_blur_preview(cr, d, scale)?;
+        } else {
+            draw_annotation(cr, d, scale, blur)?;
+        }
     }
     Ok(())
 }

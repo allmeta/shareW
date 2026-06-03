@@ -79,7 +79,7 @@ impl Editor {
             show_thickness_slider: false,
             drag: Drag::None,
             blur_mosaic: None,
-            blur_block: render::blur_block(scale),
+            blur_block: render::BLUR_DOWNSAMPLE,
         }
     }
 
@@ -133,9 +133,12 @@ impl Editor {
         if !self.needs_blur() || self.blur_mosaic.is_some() {
             return;
         }
-        match render::build_blur_mosaic(&self.screenshot, self.width, self.height, self.blur_block) {
-            Ok(m) => self.blur_mosaic = Some(m),
-            Err(err) => eprintln!("shareW: failed to build blur mosaic: {err}"),
+        match render::build_blur_surface(&self.screenshot, self.width, self.height, self.scale) {
+            Ok((m, ds)) => {
+                self.blur_mosaic = Some(m);
+                self.blur_block = ds;
+            }
+            Err(err) => eprintln!("shareW: failed to build blur surface: {err}"),
         }
     }
 
