@@ -625,8 +625,18 @@ pub fn draw_annotations(
     draw: Option<&Annotation>,
     blur: Option<(&ImageSurface, i32)>,
 ) -> anyhow::Result<()> {
+    // Blur only obscures the underlying screenshot, so paint every blur region first. The other
+    // drawing tools (shapes, lines, arrows, freehand, highlight) then render on top and are never
+    // covered or blurred by a blur stroke, regardless of the order they were added.
     for a in annotations {
-        draw_annotation(cr, a, scale, blur)?;
+        if a.tool == Tool::Blur {
+            draw_annotation(cr, a, scale, blur)?;
+        }
+    }
+    for a in annotations {
+        if a.tool != Tool::Blur {
+            draw_annotation(cr, a, scale, blur)?;
+        }
     }
     if let Some(d) = draw {
         // Painting the frosted-glass fill means bilinearly upscaling the blur surface across the
