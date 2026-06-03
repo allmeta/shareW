@@ -30,6 +30,9 @@ pub struct Editor {
     scale: f64,
     // The output the pointer is currently on (canvas coords); the toolbar/popups live here.
     view: Rect,
+    // The output a drag is confined to, locked when the press starts so a tool can't overflow onto
+    // an adjacent monitor if the pointer wanders there mid-drag.
+    draw_bounds: Rect,
 
     tool: Tool,
     draw_color: [f64; 4],
@@ -63,6 +66,7 @@ impl Editor {
             height,
             scale,
             view: Rect { x: 0, y: 0, w: width, h: height },
+            draw_bounds: Rect { x: 0, y: 0, w: width, h: height },
             tool: Tool::Crop,
             draw_color: render::DEFAULT_COLOR,
             highlight_color: render::HIGHLIGHT_COLOR,
@@ -84,7 +88,8 @@ impl Editor {
     }
 
     fn clamp(&self, x: i32, y: i32) -> (i32, i32) {
-        (x.clamp(0, self.width - 1), y.clamp(0, self.height - 1))
+        let b = self.draw_bounds;
+        (x.clamp(b.x, b.x + b.w - 1), y.clamp(b.y, b.y + b.h - 1))
     }
 
     fn active_color_mut(&mut self) -> &mut [f64; 4] {
@@ -214,6 +219,8 @@ impl Editor {
     // -- Input ---------------------------------------------------------------
 
     pub fn pointer_down(&mut self, x: i32, y: i32) {
+        // Confine this drag to the monitor it began on.
+        self.draw_bounds = self.view;
         let (x, y) = self.clamp(x, y);
         let point = (x, y);
 

@@ -667,11 +667,14 @@ pub fn draw_selection_border(cr: &Context, sel: Rect, scale: f64) -> anyhow::Res
     cr.set_source_rgb(1., 1., 1.);
     cr.set_line_width(bw);
     cr.set_line_join(LineJoin::Miter);
+    // Inset the stroke so it sits entirely inside the selection rectangle. An outset border would
+    // extend bw px past the selection edge, spilling onto an adjacent monitor when the selection is
+    // clamped to a screen edge.
     cr.rectangle(
-        sel.x as f64 - bw / 2.,
-        sel.y as f64 - bw / 2.,
-        sel.w as f64 + bw,
-        sel.h as f64 + bw,
+        sel.x as f64 + bw / 2.,
+        sel.y as f64 + bw / 2.,
+        sel.w as f64 - bw,
+        sel.h as f64 - bw,
     );
     cr.stroke()?;
     Ok(())
